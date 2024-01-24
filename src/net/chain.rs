@@ -8,7 +8,7 @@ use std::{
 use futures_util::{ready, stream::FuturesUnordered, Future, FutureExt, StreamExt};
 use libp2p::PeerId;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     blocktree::{AddedBlockResult, BlockTree, Error},
