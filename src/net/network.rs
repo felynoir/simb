@@ -256,7 +256,6 @@ impl NetworkManager {
                 }
             }
             NetworkProviderMessage::GetClosestPeers { sender } => {
-                debug!("cmd::GetClosestPeers");
                 let local_peer_id = *self.swarm.local_peer_id();
                 let query_id = self
                     .swarm
@@ -289,9 +288,9 @@ impl NetworkManager {
         }
     }
 
-    fn handle_event(&mut self, event: SwarmEvent<AppBehaviourEvent>) {
+    fn handle_mdns_event(&mut self, event: mdns::Event) {
         match event {
-            SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+            mdns::Event::Discovered(list) => {
                 for (peer_id, multiaddr) in list {
                     info!("mDNS discovered a new peer: {peer_id}");
                     self.swarm
@@ -305,7 +304,7 @@ impl NetworkManager {
                         .add_address(&peer_id, multiaddr);
                 }
             }
-            SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+            mdns::Event::Expired(list) => {
                 for (peer_id, multiaddr) in list {
                     info!("mDNS discover peer has expired: {peer_id}");
                     self.swarm
@@ -319,6 +318,57 @@ impl NetworkManager {
                         .remove_address(&peer_id, &multiaddr);
                 }
             }
+        }
+    }
+
+    fn handle_kad_event(&mut self, event: kad::Event) {
+        match event {
+            kad::Event::RoutingUpdated {
+                peer, addresses, ..
+            } => {
+                info!("Routing table updated: {:?} {:?}", peer, addresses);
+            }
+            kad::Event::OutboundQueryProgressed { id, result, .. } => match result {
+                QueryResult::Bootstrap(Ok(BootstrapOk { peer, .. })) => {
+                    info!("Successfully bootstrapped with {:?}", peer);
+                }
+                QueryResult::GetClosestPeers(result) => {
+                    if let Some(sender) = self.pending_get_closest_peers.remove(&id) {
+                        let response = match result {
+                            Ok(GetClosestPeersOk { peers, .. }) => {
+                                info!("Got {} closest peers: {:?}", peers.len(), peers);
+                                Ok(peers)
+                            }
+                            Err(GetClosestPeersError::Timeout { .. }) => Err(RequestError::Timeout),
+                        };
+                        sender.send(response).expect("Reciever not to dropped");
+                    } else {
+                        warn!("No sender for closest peers query id: {}", id);
+                    }
+                }
+                QueryResult::Bootstrap(result) => match result {
+                    Ok(BootstrapOk { peer, .. }) => {
+                        info!("Successfully bootstrapped with {:?}", peer);
+                    }
+                    Err(e) => {
+                        error!("Failed to bootstrap: {:?}", e);
+                    }
+                },
+                res => {
+                    debug!("Un handle query result: {:?}", res);
+                }
+            },
+            evt => {
+                debug!("Un handle kad event: {:?}", evt);
+            }
+        }
+    }
+
+    fn handle_event(&mut self, event: SwarmEvent<AppBehaviourEvent>) {
+        match event {
+            SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(event)) => {
+                self.handle_mdns_event(event);
+            }
             SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                 propagation_source,
                 message,
@@ -327,55 +377,8 @@ impl NetworkManager {
                 info!("Got gossipsub message from: {}", propagation_source);
                 self.handle_gossipsub_message(message);
             }
-            SwarmEvent::Behaviour(AppBehaviourEvent::Kad(kad::Event::RoutingUpdated {
-                peer,
-                addresses,
-                ..
-            })) => {
-                info!("Routing table updated: {:?} {:?}", peer, addresses);
-            }
-            SwarmEvent::Behaviour(AppBehaviourEvent::Kad(
-                kad::Event::OutboundQueryProgressed {
-                    id,
-                    result: QueryResult::GetClosestPeers(result),
-                    ..
-                },
-            )) => match result {
-                Ok(GetClosestPeersOk { peers, .. }) => {
-                    info!("Got closest peers ({}): {:?}", peers.len(), peers);
-                    if let Some(sender) = self.pending_get_closest_peers.remove(&id) {
-                        if sender.send(Ok(peers)).is_err() {
-                            // This means the receiver has been dropped
-                            // which should never happen
-                            panic!("receiver dropped when request for get closest peers")
-                        }
-                    } else {
-                        warn!("No sender for closest peers query id: {}", id);
-                    }
-                }
-                Err(GetClosestPeersError::Timeout { key, peers, .. }) => {
-                    error!("Failed to get closest peers: {:?} {:?}", key, peers);
-
-                    if let Some(sender) = self.pending_get_closest_peers.remove(&id) {
-                        if sender.send(Err(RequestError::Timeout)).is_err() {
-                            // This means the receiver has been dropped
-                            panic!("receiver dropped when request for get closest peers and got time out")
-                        }
-                    } else {
-                        warn!("No sender for closest peers query id: {}", id);
-                    }
-                }
-            },
-            SwarmEvent::Behaviour(AppBehaviourEvent::Kad(
-                kad::Event::OutboundQueryProgressed {
-                    result: QueryResult::Bootstrap(result),
-                    ..
-                },
-            )) => {
-                info!("Bootstrap result: {:?}", result);
-                if let Ok(BootstrapOk { peer, .. }) = result {
-                    info!("Successfully bootstrapped with {:?}", peer);
-                }
+            SwarmEvent::Behaviour(AppBehaviourEvent::Kad(event)) => {
+                self.handle_kad_event(event);
             }
             SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(
                 request_response::Event::OutboundFailure {
