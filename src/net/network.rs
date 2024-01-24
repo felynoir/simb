@@ -364,6 +364,53 @@ impl NetworkManager {
         }
     }
 
+    fn handle_request_response_header_event(
+        &mut self,
+        event: request_response::Event<HeadersRequest, HeadersResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { message, .. } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    let (respond, rx) = oneshot::channel();
+                    self.event_sender
+                        .send(ChainNetworkEvent::GetBlockHeaders {
+                            respond,
+                            request,
+                            channel,
+                        })
+                        .expect("Chain network receiver not dropped.");
+
+                    self.incoming_peer_requests.push(GetBlockHeaders { rx });
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    if let Some(GetHeadersRequest { sender, .. }) =
+                        self.pending_request_headers.remove(&request_id)
+                    {
+                        sender.send(Ok(response)).expect("Receiver not to dropped.");
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => {
+                if let Some(GetHeadersRequest { sender, .. }) =
+                    self.pending_request_headers.remove(&request_id)
+                {
+                    sender.send(Err(error.into())).expect("Receiver dropped");
+                } else {
+                    warn!("Pending request not found for request id: {}", request_id)
+                }
+            }
+            request_response::Event::InboundFailure { .. } => {}
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
     fn handle_event(&mut self, event: SwarmEvent<AppBehaviourEvent>) {
         match event {
             SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(event)) => {
@@ -380,50 +427,9 @@ impl NetworkManager {
             SwarmEvent::Behaviour(AppBehaviourEvent::Kad(event)) => {
                 self.handle_kad_event(event);
             }
-            SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(
-                request_response::Event::OutboundFailure {
-                    request_id, error, ..
-                },
-            )) => {
-                if let Some(GetHeadersRequest { sender, .. }) =
-                    self.pending_request_headers.remove(&request_id)
-                {
-                    sender.send(Err(error.into())).expect("Receiver dropped");
-                } else {
-                    warn!("Pending request not found for request id: {}", request_id)
-                }
+            SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(event)) => {
+                self.handle_request_response_header_event(event);
             }
-            SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(
-                request_response::Event::ResponseSent { .. },
-            )) => {}
-            SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(
-                request_response::Event::Message { message, .. },
-            )) => match message {
-                request_response::Message::Request {
-                    request, channel, ..
-                } => {
-                    let (respond, rx) = oneshot::channel();
-                    self.event_sender
-                        .send(ChainNetworkEvent::GetBlockHeaders {
-                            respond,
-                            request,
-                            channel,
-                        })
-                        .expect("send event");
-
-                    self.incoming_peer_requests.push(GetBlockHeaders { rx });
-                }
-                request_response::Message::Response {
-                    request_id,
-                    response,
-                } => {
-                    if let Some(GetHeadersRequest { sender, .. }) =
-                        self.pending_request_headers.remove(&request_id)
-                    {
-                        sender.send(Ok(response)).expect("send request");
-                    }
-                }
-            },
             SwarmEvent::IncomingConnection { .. } => {}
             SwarmEvent::IncomingConnectionError { .. } => {}
             SwarmEvent::ConnectionClosed { .. } => {}
