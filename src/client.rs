@@ -141,10 +141,14 @@ impl ClientBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use futures_util::Future;
     use libp2p::{identity::Keypair, Multiaddr, PeerId};
     use once_cell::sync::Lazy;
     use tempdir::TempDir;
-    use tracing::{error, info};
+    use tokio::time::sleep;
+    use tracing::{debug, error, info};
 
     use crate::{
         blocktree::{BlockTree, Chain},
@@ -208,6 +212,24 @@ mod tests {
         }
         nodes
     }
+    async fn assert_with_retry<F, Fut>(mut assertion: F, attempts: u32, delay: Duration)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let mut attempt_count = 0;
+        loop {
+            if attempt_count >= attempts {
+                return;
+                panic!("Assertion failed after {} attempts", attempts);
+            }
+            if assertion().await {
+                return; // Assertion passed
+            }
+            attempt_count += 1;
+            sleep(delay).await;
+        }
+    }
 
     #[tokio::test]
     async fn test_two_node_sync() {
@@ -215,11 +237,103 @@ mod tests {
         let mut nodes = spawn_nodes(2).await;
 
         nodes[0].dial(nodes[1].id, nodes[1].addrs[0].clone()).await;
+
+        // wait for gossipsub to do the task.
+        sleep(Duration::from_secs(2)).await;
         nodes[0].mining().await;
 
-        let head1 = nodes[0].blockchain.tip().unwrap();
-        let head2 = nodes[1].blockchain.tip().unwrap();
+        assert_with_retry(
+            || async {
+                let head1 = nodes[0].blockchain.tip().unwrap();
+                let head2 = nodes[1].blockchain.tip().unwrap();
+                head1 == head2
+            },
+            100,
+            Duration::from_millis(100),
+        )
+        .await;
+    }
 
-        assert_eq!(head1, head2);
+    #[tokio::test]
+    async fn test_sprase_connected_sync() {
+        Lazy::force(&TRACING);
+        let num = 10;
+        let mut nodes = spawn_nodes(num).await;
+
+        // node0 -> node1 -> node2 -> node3 -> node4 -> node5 -> node6 -> node7 -> node8 -> node9
+        for i in 0..num - 1 {
+            nodes[i]
+                .dial(nodes[i + 1].id, nodes[i + 1].addrs[0].clone())
+                .await;
+        }
+
+        for _ in 0..10 {
+            // currently we need to have one node mining since we have no consensus to select best chain
+            nodes[0].mining().await;
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        let first = nodes[0].blockchain.tip().unwrap();
+
+        assert_with_retry(
+            || async {
+                nodes[1..num]
+                    .iter()
+                    .all(|node| node.blockchain.tip().unwrap() == first)
+            },
+            100,
+            Duration::from_millis(100),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_unconnected_group_sync() {
+        Lazy::force(&TRACING);
+        let num = 10;
+        let mut nodes = spawn_nodes(num).await;
+
+        // node0 -> node1 -> node2 -> node3 -> node4
+        for i in 0..4 {
+            nodes[i]
+                .dial(nodes[i + 1].id, nodes[i + 1].addrs[0].clone())
+                .await;
+        }
+
+        // node5 -> node6 -> node7 -> node8 -> node9
+        for i in 5..num - 1 {
+            nodes[i]
+                .dial(nodes[i + 1].id, nodes[i + 1].addrs[0].clone())
+                .await;
+        }
+
+        for _ in 0..10 {
+            // currently we need to have one node mining since we have no consensus to select best chain
+            nodes[4].mining().await;
+            nodes[7].mining().await;
+            // this shoud not too fast, otherwise some node may not even establish connection
+            // or maybe have more granular control on node connection
+            sleep(Duration::from_millis(300)).await;
+        }
+
+        let first_group = nodes[4].blockchain.tip().unwrap();
+        let second_group = nodes[7].blockchain.tip().unwrap();
+
+        debug!("first_group: {:?}", first_group);
+        debug!("second_group: {:?}", second_group);
+
+        assert_with_retry(
+            || async {
+                nodes[0..5]
+                    .iter()
+                    .all(|node| node.blockchain.tip().unwrap() == first_group)
+                    && nodes[5..num]
+                        .iter()
+                        .all(|node| node.blockchain.tip().unwrap() == second_group)
+            },
+            100,
+            Duration::from_millis(100),
+        )
+        .await;
     }
 }

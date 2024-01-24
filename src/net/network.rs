@@ -290,29 +290,29 @@ impl NetworkManager {
             SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                 for (peer_id, multiaddr) in list {
                     info!("mDNS discovered a new peer: {peer_id}");
-                    self.swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .add_explicit_peer(&peer_id);
+                    // self.swarm
+                    //     .behaviour_mut()
+                    //     .gossipsub
+                    //     .add_explicit_peer(&peer_id);
 
-                    self.swarm
-                        .behaviour_mut()
-                        .kad
-                        .add_address(&peer_id, multiaddr);
+                    // self.swarm
+                    //     .behaviour_mut()
+                    //     .kad
+                    //     .add_address(&peer_id, multiaddr);
                 }
             }
             SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
                 for (peer_id, multiaddr) in list {
                     info!("mDNS discover peer has expired: {peer_id}");
-                    self.swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .remove_explicit_peer(&peer_id);
+                    // self.swarm
+                    //     .behaviour_mut()
+                    //     .gossipsub
+                    //     .remove_explicit_peer(&peer_id);
 
-                    self.swarm
-                        .behaviour_mut()
-                        .kad
-                        .remove_address(&peer_id, &multiaddr);
+                    // self.swarm
+                    //     .behaviour_mut()
+                    //     .kad
+                    //     .remove_address(&peer_id, &multiaddr);
                 }
             }
             SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message {

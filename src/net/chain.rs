@@ -262,7 +262,7 @@ where
                         this.send_sync_requests(header, peers);
                     }
                     Err(e) => {
-                        error!("Error while getting closest peers: {:?}", e);
+                        warn!("Error while getting closest peers: {:?}", e);
                     }
                 }
             } else {
@@ -300,12 +300,19 @@ where
                         cnt += 1;
                     }
                     info!("Total valid {} headers has been added to chain.", cnt);
+                    info!(
+                        "Update current tip: {}",
+                        this.chain
+                            .tip()
+                            .expect("Be able to get tip if not it is fatal error.")
+                            .number
+                    );
 
                     // we are done with this sync request, so we can send new sync request
                     this.pending_sync_request = false;
                 }
                 Err(e) => {
-                    info!("Error while sync header: {:?}", e);
+                    warn!("Error while sync header: {:?}", e);
                 }
             }
         }
@@ -314,7 +321,7 @@ where
             match res {
                 Ok(_) => {}
                 Err(e) => {
-                    info!("Error while broadcast header: {:?}", e);
+                    warn!("Error while broadcast header: {:?}", e);
                 }
             }
         }
