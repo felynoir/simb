@@ -22,6 +22,7 @@ pub struct ClientBuilder {
     auto_mine_interval: Option<u64>,
     keypair: Keypair,
     listening_addrs: Vec<Multiaddr>,
+    enabled_mdns: bool,
 }
 impl Default for ClientBuilder {
     fn default() -> Self {
@@ -30,6 +31,7 @@ impl Default for ClientBuilder {
             auto_mine_interval: None,
             listening_addrs: vec![],
             keypair: Keypair::generate_ed25519(),
+            enabled_mdns: false,
         }
     }
 }
@@ -52,6 +54,11 @@ impl ClientBuilder {
 
     pub fn with_keypair(mut self, keypair: Keypair) -> Self {
         self.keypair = keypair;
+        self
+    }
+
+    pub fn with_mdns(mut self, enabled: bool) -> Self {
+        self.enabled_mdns = enabled;
         self
     }
 
@@ -109,7 +116,7 @@ impl ClientBuilder {
                 libp2p::yamux::Config::default,
             )
             .unwrap()
-            .with_behaviour(|key| AppBehaviour::new(key.clone()))
+            .with_behaviour(|key| AppBehaviour::new(key.clone(), self.enabled_mdns))
             .unwrap()
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
@@ -141,11 +148,12 @@ impl ClientBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{fmt::Debug, time::Duration};
 
     use futures_util::Future;
     use libp2p::{identity::Keypair, Multiaddr, PeerId};
     use once_cell::sync::Lazy;
+    use pretty_assertions::assert_eq;
     use tempdir::TempDir;
     use tokio::time::sleep;
     use tracing::{debug, error, info};
@@ -173,6 +181,7 @@ mod tests {
             let db_path = dir.path().join(format!("db_{}.redb", idx));
             let (blockchain, mut provider, _, _) = ClientBuilder::default()
                 .with_db_path(db_path)
+                .with_mdns(false)
                 .with_keypair(keypair.clone())
                 .start_network();
 
@@ -220,10 +229,33 @@ mod tests {
         let mut attempt_count = 0;
         loop {
             if attempt_count >= attempts {
-                return;
                 panic!("Assertion failed after {} attempts", attempts);
             }
             if assertion().await {
+                return; // Assertion passed
+            }
+            attempt_count += 1;
+            sleep(delay).await;
+        }
+    }
+
+    async fn assert_eq_with_retry<F, Fut, T>(
+        mut assertion: F,
+        attempts: u32,
+        delay: Duration,
+        expected: T,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = T>,
+        T: PartialEq + Debug,
+    {
+        let mut attempt_count = 0;
+        loop {
+            if attempt_count >= attempts {
+                assert_eq!(assertion().await, expected);
+            }
+            let actual = assertion().await;
+            if actual == expected {
                 return; // Assertion passed
             }
             attempt_count += 1;
@@ -255,7 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sprase_connected_sync() {
+    async fn test_line_connected_sync() {
         Lazy::force(&TRACING);
         let num = 10;
         let mut nodes = spawn_nodes(num).await;
@@ -270,19 +302,23 @@ mod tests {
         for _ in 0..10 {
             // currently we need to have one node mining since we have no consensus to select best chain
             nodes[0].mining().await;
-            sleep(Duration::from_millis(100)).await;
+            // this should make it more stable syncing.
+            sleep(Duration::from_millis(200)).await;
         }
 
         let first = nodes[0].blockchain.tip().unwrap();
+        let expected = vec![first.clone(); num];
 
-        assert_with_retry(
+        assert_eq_with_retry(
             || async {
-                nodes[1..num]
+                nodes
                     .iter()
-                    .all(|node| node.blockchain.tip().unwrap() == first)
+                    .map(|node| node.blockchain.tip().unwrap())
+                    .collect::<Vec<_>>()
             },
             100,
             Duration::from_millis(100),
+            expected,
         )
         .await;
     }
@@ -307,13 +343,14 @@ mod tests {
                 .await;
         }
 
+        // this shoud not too fast, otherwise some node may not even establish connection
+        // or maybe have more granular control on node connection
+        sleep(Duration::from_millis(300)).await;
+
         for _ in 0..10 {
             // currently we need to have one node mining since we have no consensus to select best chain
             nodes[4].mining().await;
             nodes[7].mining().await;
-            // this shoud not too fast, otherwise some node may not even establish connection
-            // or maybe have more granular control on node connection
-            sleep(Duration::from_millis(300)).await;
         }
 
         let first_group = nodes[4].blockchain.tip().unwrap();
@@ -321,18 +358,19 @@ mod tests {
 
         debug!("first_group: {:?}", first_group);
         debug!("second_group: {:?}", second_group);
+        let mut expected = vec![first_group.clone(); 5];
+        expected.extend(vec![second_group.clone(); 5]);
 
-        assert_with_retry(
+        assert_eq_with_retry(
             || async {
-                nodes[0..5]
+                nodes[0..num]
                     .iter()
-                    .all(|node| node.blockchain.tip().unwrap() == first_group)
-                    && nodes[5..num]
-                        .iter()
-                        .all(|node| node.blockchain.tip().unwrap() == second_group)
+                    .map(|node| node.blockchain.tip().unwrap())
+                    .collect::<Vec<_>>()
             },
             100,
             Duration::from_millis(100),
+            expected,
         )
         .await;
     }

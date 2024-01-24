@@ -20,7 +20,7 @@ use libp2p::{
     mdns,
     multiaddr::Protocol,
     request_response::{self, Config, OutboundRequestId, ProtocolSupport},
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     StreamProtocol, Swarm,
 };
 
@@ -35,15 +35,19 @@ use tracing::{debug, error, info, warn};
 #[derive(NetworkBehaviour)]
 pub struct AppBehaviour {
     pub request_response: request_response::json::Behaviour<HeadersRequest, HeadersResponse>,
-    pub mdns: mdns::tokio::Behaviour,
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub gossipsub: gossipsub::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
 }
 
 impl AppBehaviour {
-    pub fn new(keypair: Keypair) -> AppBehaviour {
+    pub fn new(keypair: Keypair, enable_mdns: bool) -> AppBehaviour {
         let peer_id = keypair.public().to_peer_id();
-        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).unwrap();
+        let mdns = if enable_mdns {
+            Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).unwrap())
+        } else {
+            None
+        };
         let privacy = gossipsub::MessageAuthenticity::Signed(keypair);
         let message_id_fn = |message: &gossipsub::Message| {
             let mut s = DefaultHasher::new();
@@ -66,7 +70,7 @@ impl AppBehaviour {
                 [(StreamProtocol::new("/chain"), ProtocolSupport::Full)],
                 Config::default(),
             ),
-            mdns,
+            mdns: mdns.into(),
             gossipsub,
             kad,
         }
