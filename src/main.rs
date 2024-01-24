@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use argh::FromArgs;
+use libp2p::identity::Keypair;
 use libp2p::Multiaddr;
 use once_cell::sync::Lazy;
-use simb::client::Client;
+use simb::client::ClientBuilder;
 use simb::TRACING;
 
 #[derive(FromArgs)]
@@ -44,6 +45,19 @@ async fn main() {
         opts.db_path.unwrap_or("./db.redb".into())
     };
 
-    let client = Client::new(db_path, opts.auto_mine_interval, opts.peers, opts.seed);
-    client.execute().await;
+    let keypair = match opts.seed {
+        Some(seed) => {
+            let mut bytes = [0u8; 32];
+            bytes[0] = seed;
+            Keypair::ed25519_from_bytes(bytes).unwrap()
+        }
+        None => Keypair::generate_ed25519(),
+    };
+
+    let _ = ClientBuilder::default()
+        .with_db_path(db_path)
+        .with_keypair(keypair)
+        .with_auto_mine_interval(opts.auto_mine_interval)
+        .execute_with_seed_nodes(opts.peers)
+        .await;
 }

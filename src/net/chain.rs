@@ -69,6 +69,7 @@ where
     pub event_recv: mpsc::UnboundedReceiver<ChainNetworkEvent>,
     // a list of sync request that is in progress
     pub sync_requests: FuturesUnordered<SyncRequestsFut>,
+    pub broadcast_requests: FuturesUnordered<<P as BroadcastProvider>::Output>,
     // a request to get closest peers for sync process
     pub closest_peers_request_for_sync: Option<PeersRequest<P>>,
     // prevent redundant sync request
@@ -92,6 +93,7 @@ where
             provider,
             event_recv,
             sync_requests: Default::default(),
+            broadcast_requests: Default::default(),
             closest_peers_request_for_sync: Default::default(),
             pending_sync_request: false,
             broadcasted_headers: Default::default(),
@@ -133,7 +135,8 @@ where
                             // only broadcast if this block extend tip.
                             AddedBlockResult::ExtendTip => {
                                 info!("Successfully added new block header: {:?}", header);
-                                let _ = self.provider.broadcast_block_header(header.clone());
+                                self.broadcast_requests
+                                    .push(self.provider.broadcast_block_header(header.clone()));
                             }
                             AddedBlockResult::AlreadyInChain => {
                                 debug!("Block header already in chain");
@@ -155,7 +158,8 @@ where
                             Entry::Occupied(_) => {}
                             Entry::Vacant(entry) => {
                                 debug!("Send broadcast request for header: {:?}", header);
-                                let _ = self.provider.broadcast_block_header(header.clone());
+                                self.broadcast_requests
+                                    .push(self.provider.broadcast_block_header(header.clone()));
                                 entry.insert(());
                             }
                         }
@@ -306,6 +310,14 @@ where
             }
         }
 
+        while let Poll::Ready(Some(res)) = this.broadcast_requests.poll_next_unpin(cx) {
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    info!("Error while broadcast header: {:?}", e);
+                }
+            }
+        }
         Poll::Pending
     }
 }
@@ -322,18 +334,15 @@ pub mod tests {
     };
     use tokio::{
         spawn,
-        sync::{
-            mpsc::error::{SendError, TryRecvError},
-            oneshot,
-        },
+        sync::{mpsc::error::TryRecvError, oneshot},
         time::sleep,
     };
     use tracing::debug;
 
     use crate::{
         blocktree::{calculate_hash, Error},
-        interface::{ClosestPeersFut, HeadersFut, HeadersRequest},
-        net::{Command, GetHeadersRequest},
+        interface::{BroadcastFut, ClosestPeersFut, HeadersFut, HeadersRequest},
+        net::{GetHeadersRequest, NetworkProviderMessage},
         TRACING,
     };
 
@@ -437,13 +446,13 @@ pub mod tests {
 
     #[derive(Clone)]
     pub struct MockProvider {
-        pub sender: mpsc::UnboundedSender<Command>,
+        pub sender: mpsc::UnboundedSender<NetworkProviderMessage>,
         pub client_sender: mpsc::UnboundedSender<GetHeadersRequest>,
     }
 
     impl MockProvider {
         fn new(
-            sender: mpsc::UnboundedSender<Command>,
+            sender: mpsc::UnboundedSender<NetworkProviderMessage>,
             client_sender: mpsc::UnboundedSender<GetHeadersRequest>,
         ) -> Self {
             Self {
@@ -472,15 +481,24 @@ pub mod tests {
             Box::pin(async move { rx.await? })
         }
     }
+
     impl BroadcastProvider for MockProvider {
-        fn broadcast_block_header(&self, header: Header) -> Result<(), SendError<Command>> {
-            self.sender.send(Command::BroadcastBlockHeader { header })
+        type Output = BroadcastFut;
+        fn broadcast_block_header(&self, header: Header) -> Self::Output {
+            debug!("Received broadcast request for header: {:?}", header);
+            let (tx, _rx) = oneshot::channel();
+
+            // no need to wait
+            self.sender
+                .send(NetworkProviderMessage::BroadcastBlockHeader { tx, header })
+                .expect("Receiver should be alive");
+            Box::pin(async { Ok(()) })
         }
 
         fn broadcast_transactions(
             &self,
             _transactions: Vec<crate::interface::Transaction>,
-        ) -> Result<(), SendError<Command>> {
+        ) -> RequestResponse<()> {
             todo!()
         }
     }
@@ -573,7 +591,7 @@ pub mod tests {
 
         // check broadcast event is triggered
         match broadcast_rx.recv().await {
-            Some(Command::BroadcastBlockHeader { header }) => {
+            Some(NetworkProviderMessage::BroadcastBlockHeader { header, .. }) => {
                 assert_eq!(header, external_headers.last_key_value().unwrap().1.clone());
             }
             _ => panic!("broadcast should be ignored"),
@@ -648,6 +666,7 @@ pub mod tests {
             }
         }
 
+        debug!("wait for block added");
         // wait for block add
         new_block_added_rx.recv().await;
         // drain block add event
@@ -659,21 +678,25 @@ pub mod tests {
             generate_headers_from_genesis(50)
         );
 
+        debug!("wait for broadcast event");
+
         // broadcast process should be triggered only once per hash.
         // even if we not sync it.
         match broadcast_rx.recv().await {
-            Some(Command::BroadcastBlockHeader { header }) => {
+            Some(NetworkProviderMessage::BroadcastBlockHeader { header, .. }) => {
                 assert_eq!(header, external_headers.get(&50).unwrap().clone());
             }
             _ => panic!("no broadcast event found."),
         }
         match broadcast_rx.recv().await {
-            Some(Command::BroadcastBlockHeader { header }) => {
+            Some(NetworkProviderMessage::BroadcastBlockHeader { header, .. }) => {
                 assert_eq!(header, external_headers.get(&52).unwrap().clone());
             }
             _ => panic!("no broadcast event found."),
         }
         assert_eq!(broadcast_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+
+        debug!("New incoming block");
 
         // Incoming block header that already in the chain should be ignored
         chain_tx
@@ -716,7 +739,7 @@ pub mod tests {
 
         // block headers that already in the chain should be ignored
         match broadcast_rx.recv().await {
-            Some(Command::BroadcastBlockHeader { header }) => {
+            Some(NetworkProviderMessage::BroadcastBlockHeader { header, .. }) => {
                 assert_eq!(header, external_headers.last_key_value().unwrap().1.clone());
             }
             _ => panic!("no broadcast event found."),

@@ -2,15 +2,16 @@ use std::pin::Pin;
 
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use futures_util::{future::BoxFuture, Future};
-use libp2p::{request_response::OutboundFailure, PeerId};
+use libp2p::{
+    gossipsub::PublishError, request_response::OutboundFailure, swarm::DialError, PeerId,
+    TransportError,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{
-    mpsc::{self, error::SendError},
+    mpsc::{self},
     oneshot,
 };
-
-use crate::net::Command;
 
 #[derive(
     Serialize, Deserialize, PartialEq, Eq, RlpDecodable, RlpEncodable, Debug, Clone, Default,
@@ -84,13 +85,13 @@ pub trait BodyProvider {
     fn get_bodies(&self, request: BodyRequest) -> Self::Output;
 }
 
-pub trait BroadcastProvider {
-    fn broadcast_block_header(&self, header: Header) -> Result<(), SendError<Command>>;
+pub type BroadcastFut = Pin<Box<dyn Future<Output = RequestResponse<()>> + Sync + Send>>;
 
-    fn broadcast_transactions(
-        &self,
-        transactions: Vec<Transaction>,
-    ) -> Result<(), SendError<Command>>;
+pub trait BroadcastProvider {
+    type Output: Future<Output = RequestResponse<()>> + Sync + Send + Unpin;
+    fn broadcast_block_header(&self, header: Header) -> Self::Output;
+
+    fn broadcast_transactions(&self, transactions: Vec<Transaction>) -> RequestResponse<()>;
 }
 
 /// Error variants that can happen when sending requests to network manager.
@@ -98,21 +99,28 @@ pub trait BroadcastProvider {
 #[allow(missing_docs)]
 pub enum RequestError {
     #[error("Channel closed.")]
-    ChannelClosed,
+    ChannelClosed(String),
     #[error("Timeout while waiting for response.")]
     Timeout,
     #[error("Outbound network failure.")]
     OutboundFailure(#[from] OutboundFailure),
+    #[error("Dial peer error.")]
+    DialError(#[from] DialError),
+    #[error("Transport error.")]
+    TransportError(#[from] TransportError<std::io::Error>),
+
+    #[error("Publish error.")]
+    PublishError(#[from] PublishError),
 }
 
 impl<T> From<mpsc::error::SendError<T>> for RequestError {
-    fn from(_: mpsc::error::SendError<T>) -> Self {
-        RequestError::ChannelClosed
+    fn from(e: mpsc::error::SendError<T>) -> Self {
+        RequestError::ChannelClosed(e.to_string())
     }
 }
 
 impl From<oneshot::error::RecvError> for RequestError {
-    fn from(_: oneshot::error::RecvError) -> Self {
-        RequestError::ChannelClosed
+    fn from(e: oneshot::error::RecvError) -> Self {
+        RequestError::ChannelClosed(e.to_string())
     }
 }

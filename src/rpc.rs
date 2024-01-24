@@ -187,9 +187,7 @@ where
             })
             .unwrap();
 
-        let handle = server.start(module);
-
-        handle
+        server.start(module)
     }
 }
 

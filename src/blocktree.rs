@@ -1,5 +1,6 @@
 use std::{
     path::Path,
+    pin::Pin,
     sync::{Arc, RwLock},
     task::{Context, Poll},
     time::Duration,
@@ -7,7 +8,7 @@ use std::{
 
 use alloy_rlp::{Decodable, Encodable};
 use chrono::Utc;
-use futures_util::future::poll_fn;
+use futures_util::{future::poll_fn, ready, Future, FutureExt};
 use redb::{
     CommitError, Database, ReadableTable, StorageError, TableDefinition, TableError,
     TransactionError,
@@ -18,9 +19,9 @@ use tokio::{
     spawn,
     time::{self, Interval},
 };
-use tracing::info;
+use tracing::{error, info};
 
-use crate::interface::{BroadcastProvider, Header, Transaction};
+use crate::interface::{BroadcastProvider, Header, RequestError, RequestResponse, Transaction};
 
 #[derive(PartialEq, Error, Debug)]
 pub enum Error {
@@ -67,6 +68,14 @@ pub enum AddedBlockResult {
     AlreadyInChain,
 }
 
+#[derive(PartialEq, Debug)]
+pub enum MineBlockResult {
+    /// Block being mined and added to the chain
+    Mined(Header),
+    /// Block is being mined but not added to the chain due to falling behind the current tip
+    BlockFallingBehind,
+}
+
 /// BlockTree is a data structure that holds the chain
 /// and responsible for manage the block chain
 pub trait BlockTree: Send + Sync + Clone + Unpin + 'static {
@@ -93,6 +102,43 @@ pub trait BlockTree: Send + Sync + Clone + Unpin + 'static {
         }
 
         Ok(rand::random::<u64>())
+    }
+
+    fn mine_block(&mut self) -> MineBlockResult {
+        info!("mining block...");
+        // mine from current tip
+        let prev_block_header = self.tip().unwrap();
+        let number = prev_block_header.number + 1;
+        let parent_hash = prev_block_header.hash;
+        let timestamp = Utc::now().timestamp() as u64;
+        let random_bytes: [u8; 32] = rand::random();
+        let mut hasher = Sha256::new();
+        hasher.update(random_bytes);
+        let state_root = hex::encode(hasher.finalize().as_slice());
+
+        let data = "a block data";
+        let (nonce, hash) = mine_block(number, timestamp, &parent_hash, &state_root, data);
+        info!(
+            "mined block {}! nonce: {}, hash: {}",
+            number,
+            nonce,
+            hex::encode(&hash),
+        );
+        let header = Header {
+            hash,
+            nonce,
+            number,
+            parent_hash,
+            state_root: "".to_string(),
+            timestamp: 0,
+        };
+        match self.try_add_block_header(header.clone()) {
+            Err(e) => {
+                panic!("block mining logic failed with: {:?}", e);
+            }
+            Ok(AddedBlockResult::AlreadyInChain) => MineBlockResult::BlockFallingBehind,
+            Ok(AddedBlockResult::ExtendTip) => MineBlockResult::Mined(header),
+        }
     }
 }
 
@@ -160,6 +206,16 @@ where
         }
 
         Ok(())
+    }
+
+    pub async fn mine_and_broadcast_block(&mut self) -> Result<MineBlockResult, RequestError> {
+        match self.mine_block() {
+            MineBlockResult::Mined(header) => {
+                self.provider.broadcast_block_header(header.clone()).await?;
+                Ok(MineBlockResult::Mined(header))
+            }
+            MineBlockResult::BlockFallingBehind => Ok(MineBlockResult::BlockFallingBehind),
+        }
     }
 }
 impl<P> BlockTree for Chain<P>
@@ -254,7 +310,10 @@ mod tests {
     use tokio::time::sleep;
     use tracing::debug;
 
-    use crate::TRACING;
+    use crate::{
+        interface::{BroadcastFut, RequestError},
+        TRACING,
+    };
 
     use super::*;
 
@@ -268,17 +327,16 @@ mod tests {
     }
 
     impl BroadcastProvider for Provider {
-        fn broadcast_block_header(
-            &self,
-            header: Header,
-        ) -> Result<(), tokio::sync::mpsc::error::SendError<crate::net::Command>> {
+        type Output = BroadcastFut;
+        fn broadcast_block_header(&self, header: Header) -> Self::Output {
             debug!("broadcast block header {:?}", header);
-            Ok(())
+            Box::pin(async { Ok(()) })
         }
+
         fn broadcast_transactions(
             &self,
             _transactions: Vec<Transaction>,
-        ) -> Result<(), tokio::sync::mpsc::error::SendError<crate::net::Command>> {
+        ) -> Result<(), RequestError> {
             unimplemented!()
         }
     }
@@ -414,12 +472,36 @@ mod tests {
         assert_eq!(err, Error::Invalid);
     }
 }
+pub struct BroadcastRequest<P: BroadcastProvider> {
+    header: Header,
+    fut: P::Output,
+}
 
+pub struct BroadcastOutcome {
+    header: Header,
+    outcome: RequestResponse<()>,
+}
+
+impl<P> Future for BroadcastRequest<P>
+where
+    P: BroadcastProvider,
+{
+    type Output = BroadcastOutcome;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let outcome = ready!(this.fut.poll_unpin(cx));
+        let header = this.header.clone();
+
+        Poll::Ready(BroadcastOutcome { header, outcome })
+    }
+}
 /// A miner that mines blocks with a fixed block time
 pub struct FixedBlockTimeMiner<B: BlockTree, P: BroadcastProvider> {
     interval: Interval,
     chain: B,
     provider: P,
+    pending_broadcast: Option<BroadcastRequest<P>>,
 }
 
 impl<B, P> FixedBlockTimeMiner<B, P>
@@ -432,44 +514,41 @@ where
             interval: time::interval(Duration::from_secs(itv)),
             chain,
             provider,
+            pending_broadcast: None,
         }
     }
 
     pub async fn execute(mut self) {
         poll_fn(move |cx| {
             if let Poll::Ready(_transactions) = self.poll(cx) {
-                info!("mining block...");
-                let prev_block_header = self.chain.tip().unwrap();
-                let number = prev_block_header.number + 1;
-                let parent_hash = prev_block_header.hash;
-                let timestamp = Utc::now().timestamp() as u64;
-                let random_bytes: [u8; 32] = rand::random();
-                let mut hasher = Sha256::new();
-                hasher.update(random_bytes);
-                let state_root = hex::encode(hasher.finalize().as_slice());
-
-                let data = "a block data";
-                let (nonce, hash) = mine_block(number, timestamp, &parent_hash, &state_root, data);
-                info!(
-                    "mined block {}! nonce: {}, hash: {}",
-                    number,
-                    nonce,
-                    hex::encode(&hash),
-                );
-                let header = Header {
-                    hash,
-                    nonce,
-                    number,
-                    parent_hash,
-                    state_root: "".to_string(),
-                    timestamp: 0,
-                };
-                self.chain.try_add_block_header(header.clone()).unwrap();
-                self.provider
-                    .broadcast_block_header(header)
-                    .expect("receiver dropped");
+                match self.chain.mine_block() {
+                    MineBlockResult::Mined(header) => {
+                        self.pending_broadcast = Some(BroadcastRequest {
+                            fut: self.provider.broadcast_block_header(header.clone()),
+                            header,
+                        });
+                    }
+                    MineBlockResult::BlockFallingBehind => {}
+                }
                 let _ = self.poll(cx);
             }
+
+            if let Some(mut request) = self.pending_broadcast.take() {
+                if let Poll::Ready(BroadcastOutcome { header, outcome }) = request.poll_unpin(cx) {
+                    match outcome {
+                        Ok(_) => {
+                            info!("Broadcast success: {:?}", header);
+                        }
+                        Err(e) => {
+                            error!("Broadcast block header failed {:?}", e);
+                        }
+                    }
+                    self.pending_broadcast = None;
+                } else {
+                    self.pending_broadcast = Some(request);
+                }
+            }
+
             Poll::Pending
         })
         .await

@@ -1,5 +1,8 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{
+        hash_map::{DefaultHasher, Entry},
+        HashMap,
+    },
     hash::{Hash, Hasher},
     pin::Pin,
     task::{Context, Poll},
@@ -9,6 +12,7 @@ use std::{
 use alloy_rlp::{Decodable, Encodable};
 use futures_util::{ready, stream::FuturesUnordered, Future, FutureExt};
 use libp2p::{
+    core::transport::ListenerId,
     futures::StreamExt,
     gossipsub::{self, ValidationMode},
     identity::Keypair,
@@ -42,7 +46,6 @@ impl AppBehaviour {
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).unwrap();
         let privacy = gossipsub::MessageAuthenticity::Signed(keypair);
         let message_id_fn = |message: &gossipsub::Message| {
-            info!("hash message: {:?}", message);
             let mut s = DefaultHasher::new();
             message.data.hash(&mut s);
             gossipsub::MessageId::from(s.finish().to_string())
@@ -98,13 +101,15 @@ impl Future for GetBlockHeaders {
 ///
 /// Some task will be delate to [ChainNetworkManager](crate::net::chain::ChainNetworkManager)
 ///
-/// The interaction mainly will be done through [Command] sent by Unbounded channel
+/// The interaction mainly will be done through [NetworkProviderMessage] sent by Unbounded channel
 pub struct NetworkManager {
     swarm: Swarm<AppBehaviour>,
-    command_recv: mpsc::UnboundedReceiver<Command>,
+    command_recv: mpsc::UnboundedReceiver<NetworkProviderMessage>,
     event_sender: mpsc::UnboundedSender<ChainNetworkEvent>,
     pending_request_headers: HashMap<OutboundRequestId, GetHeadersRequest>,
     pending_get_closest_peers: HashMap<QueryId, oneshot::Sender<RequestResponse<Vec<PeerId>>>>,
+    pending_dial: HashMap<PeerId, oneshot::Sender<RequestResponse<()>>>,
+    pending_listening: HashMap<ListenerId, oneshot::Sender<RequestResponse<()>>>,
     // might be good idea to force some number of request per peer or other rate limiting
     incoming_peer_requests: FuturesUnordered<GetBlockHeaders>,
     // this should help network fresh and avoid network partition
@@ -118,7 +123,7 @@ use super::*;
 impl NetworkManager {
     pub fn new(
         swarm: Swarm<AppBehaviour>,
-        command_recv: mpsc::UnboundedReceiver<Command>,
+        command_recv: mpsc::UnboundedReceiver<NetworkProviderMessage>,
     ) -> (Self, mpsc::UnboundedReceiver<ChainNetworkEvent>) {
         let (event_sender, event_recv) = mpsc::unbounded_channel();
 
@@ -129,6 +134,8 @@ impl NetworkManager {
                 event_sender,
                 pending_get_closest_peers: Default::default(),
                 pending_request_headers: Default::default(),
+                pending_dial: Default::default(),
+                pending_listening: Default::default(),
                 incoming_peer_requests: Default::default(),
                 // this is arbitary value
                 bootstrap_interval: time::interval(Duration::from_secs(60 * 5)),
@@ -161,7 +168,7 @@ impl NetworkManager {
                 event = self.swarm.select_next_some() => self.handle_event(event),
                 command = self.command_recv.recv() => match command {
                     Some(c) => self.handle_command(c),
-                    // Command channel closed, thus shutting down the network event loop.
+                    // NetworkProviderMessage channel closed, thus shutting down the network event loop.
                     None=>  return,
                 },
                 response = self.incoming_peer_requests.select_next_some(), if !self.incoming_peer_requests.is_empty() => {
@@ -174,43 +181,77 @@ impl NetworkManager {
         }
     }
 
-    fn handle_command(&mut self, command: Command) {
+    fn handle_command(&mut self, command: NetworkProviderMessage) {
         match command {
-            Command::Dial { peer_id, peer_addr } => {
-                info!("Dialing peer: {:?} @{:?}", peer_id, peer_addr);
-                self.swarm
-                    .behaviour_mut()
-                    .kad
-                    .add_address(&peer_id, peer_addr.clone());
+            NetworkProviderMessage::StartListening { addr, tx } => {
+                match self.swarm.listen_on(addr.clone()) {
+                    Err(e) => tx.send(Err(e.into())).expect("Reciever not dropped"),
+                    Ok(listener_id) => {
+                        info!("Start listening on: {:?}", addr);
+                        self.pending_listening.insert(listener_id, tx);
+                    }
+                };
+            }
+            NetworkProviderMessage::ListenAddrs { tx } => {
+                let mut addrs = Vec::new();
+                addrs.extend(
+                    self.swarm
+                        .listeners()
+                        .map(|addr| addr.to_owned())
+                        .collect::<Vec<_>>(),
+                );
+                addrs.extend(self.swarm.external_addresses().map(|addr| addr.to_owned()));
 
-                match self.swarm.dial(peer_addr.with(Protocol::P2p(peer_id))) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        error!("Failed to dial peer: {:?}", e);
+                tx.send(Ok(addrs)).expect("Reciever not dropped");
+            }
+            NetworkProviderMessage::Dial {
+                peer_id,
+                peer_addr,
+                tx,
+            } => {
+                info!("Dialing peer: {:?} @{:?}", peer_id, peer_addr);
+                match self.pending_dial.entry(peer_id) {
+                    Entry::Vacant(entry) => {
+                        if let Err(e) = self
+                            .swarm
+                            .dial(peer_addr.clone().with(Protocol::P2p(peer_id)))
+                        {
+                            tx.send(Err(e.into())).expect("Reciever not dropped");
+                        } else {
+                            self.swarm
+                                .behaviour_mut()
+                                .kad
+                                .add_address(&peer_id, peer_addr);
+                            entry.insert(tx);
+                        }
+                    }
+                    Entry::Occupied(_) => {
+                        debug!("Already dial")
                     }
                 }
             }
-            Command::BroadcastTransactions { transactions: _ } => {
+            NetworkProviderMessage::BroadcastTransactions { transactions: _ } => {
                 todo!()
             }
             // Broadcast block header to the network
             // this should be called after block is validate and added to local chain
-            Command::BroadcastBlockHeader { header } => {
+            NetworkProviderMessage::BroadcastBlockHeader { tx, header } => {
                 info!("Broadcast block header: {:?}", header);
                 let mut buf = Vec::new();
                 header.encode(&mut buf);
 
-                // TOOD: implement retry logic
                 if let Err(e) = self
                     .swarm
                     .behaviour_mut()
                     .gossipsub
                     .publish(BLOCK_HEADER.clone(), buf)
                 {
-                    error!("error publishing block header {:?}", e);
+                    tx.send(Err(e.into())).expect("Receiver not to be dropped");
+                } else {
+                    tx.send(Ok(())).expect("Reciever not to be dropped");
                 }
             }
-            Command::GetClosestPeers { sender } => {
+            NetworkProviderMessage::GetClosestPeers { sender } => {
                 debug!("cmd::GetClosestPeers");
                 let local_peer_id = *self.swarm.local_peer_id();
                 let query_id = self
@@ -221,7 +262,7 @@ impl NetworkManager {
 
                 self.pending_get_closest_peers.insert(query_id, sender);
             }
-            Command::GetHeaders(GetHeadersRequest {
+            NetworkProviderMessage::GetHeaders(GetHeadersRequest {
                 peer,
                 request,
                 sender,
@@ -377,30 +418,39 @@ impl NetworkManager {
                 }
             },
             SwarmEvent::IncomingConnection { .. } => {}
+            SwarmEvent::IncomingConnectionError { .. } => {}
+            SwarmEvent::ConnectionClosed { .. } => {}
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
                 info!(
-                    "Connection established with: {:?} endpoint: {:?}",
+                    "Connection established: {:?} endpoint: {:?}",
                     peer_id, endpoint
                 );
-            }
-            SwarmEvent::ConnectionClosed { .. } => {}
-            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                if let Some(peer_id) = peer_id {
-                    error!(
-                        "Failed to connect to peer: {:?} error: {:?}",
-                        peer_id, error
-                    );
+                if endpoint.is_dialer() {
+                    if let Some(sender) = self.pending_dial.remove(&peer_id) {
+                        sender.send(Ok(())).expect("Reciever not dropped")
+                    }
                 }
             }
-            SwarmEvent::IncomingConnectionError { .. } => {}
-            SwarmEvent::Dialing {
-                peer_id: Some(peer_id),
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                if let Some(peer_id) = peer_id {
+                    if let Some(sender) = self.pending_dial.remove(&peer_id) {
+                        sender
+                            .send(Err(error.into()))
+                            .expect("Reciever not dropped");
+                    }
+                }
+            }
+            SwarmEvent::NewListenAddr {
+                address,
+                listener_id,
                 ..
-            } => eprintln!("Dialing {peer_id}"),
-            SwarmEvent::NewListenAddr { address, .. } => {
-                info!("Local node is listening on {address}");
+            } => {
+                info!("New listen address: {:?}", address);
+                if let Some(sender) = self.pending_listening.remove(&listener_id) {
+                    sender.send(Ok(())).expect("Reciever not dropped")
+                }
             }
             _ => {}
         }
@@ -437,49 +487,3 @@ impl NetworkManager {
         }
     }
 }
-/*
-impl Future for NetworkManager {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        loop {
-            //if this.bootstrap_interval.poll_tick(cx).is_ready() {
-            //    let _ = this.swarm.behaviour_mut().kad.bootstrap();
-            //}
-
-            while let Poll::Ready(event) = this.swarm.select_next_some().poll_unpin(cx) {
-                this.handle_event(event);
-            }
-
-            while let Poll::Ready(Some(command)) = this.command_recv.poll_recv(cx) {
-                this.handle_command(command);
-            }
-
-            //let mut responses = vec![];
-
-            //for (_peer, response) in this.peer_responses.iter_mut() {
-            //    match response {
-            //        IncomingPeerRequest::GetBlockHeaders { rx } => match rx.poll_unpin(cx) {
-            //            Poll::Ready(result) => {
-            //                let result = result.map_err(RequestError::from).and_then(|res| res);
-
-            //                if let Ok(response) = result {
-            //                    responses.push(response);
-            //                } else {
-            //                    info!("Failed to get headers from peer: {:?}", result);
-            //                }
-            //            }
-            //            Poll::Pending => {}
-            //        },
-            //    }
-            //}
-
-            //for response in responses {
-            //    this.handle_respond_block_headers(response);
-            //}
-        }
-    }
-}
-
- */

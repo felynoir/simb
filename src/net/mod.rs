@@ -32,14 +32,16 @@ pub struct GetHeadersRequest {
     sender: oneshot::Sender<RequestResponse<HeadersResponse>>,
 }
 
+/// Message send to [`NetworkProvider`]
 #[derive(Debug)]
-pub enum Command {
+pub enum NetworkProviderMessage {
     /// Request for closest peers
     GetClosestPeers {
         sender: oneshot::Sender<RequestResponse<Vec<PeerId>>>,
     },
     BroadcastBlockHeader {
         header: Header,
+        tx: oneshot::Sender<RequestResponse<()>>,
     },
     BroadcastTransactions {
         transactions: Vec<Transaction>,
@@ -48,6 +50,14 @@ pub enum Command {
     Dial {
         peer_id: PeerId,
         peer_addr: Multiaddr,
+        tx: oneshot::Sender<RequestResponse<()>>,
+    },
+    ListenAddrs {
+        tx: oneshot::Sender<RequestResponse<Vec<Multiaddr>>>,
+    },
+    StartListening {
+        addr: Multiaddr,
+        tx: oneshot::Sender<RequestResponse<()>>,
     },
 }
 
