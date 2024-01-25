@@ -308,12 +308,8 @@ mod tests {
     use once_cell::sync::Lazy;
     use tempdir::TempDir;
     use tokio::time::sleep;
-    use tracing::debug;
 
-    use crate::{
-        interface::{BroadcastFut, RequestError},
-        TRACING,
-    };
+    use crate::{interface::BroadcastFut, TRACING};
 
     use super::*;
 
@@ -328,16 +324,12 @@ mod tests {
 
     impl BroadcastProvider for Provider {
         type Output = BroadcastFut;
-        fn broadcast_block_header(&self, header: Header) -> Self::Output {
-            debug!("broadcast block header {:?}", header);
+        fn broadcast_block_header(&self, _header: Header) -> Self::Output {
             Box::pin(async { Ok(()) })
         }
 
-        fn broadcast_transactions(
-            &self,
-            _transactions: Vec<Transaction>,
-        ) -> Result<(), RequestError> {
-            unimplemented!()
+        fn broadcast_transactions(&self, _transactions: Vec<Transaction>) -> Self::Output {
+            Box::pin(async { Ok(()) })
         }
     }
 

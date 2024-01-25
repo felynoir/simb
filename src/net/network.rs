@@ -234,8 +234,21 @@ impl NetworkManager {
                     }
                 }
             }
-            NetworkProviderMessage::BroadcastTransactions { transactions: _ } => {
-                todo!()
+            NetworkProviderMessage::BroadcastTransactions { tx, transactions } => {
+                info!("Broadcast transactions: {:?}", transactions);
+                let mut buf = Vec::new();
+                transactions.encode(&mut buf);
+
+                if let Err(e) = self
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(TRANSACTIONS.clone(), buf)
+                {
+                    tx.send(Err(e.into())).expect("Receiver not to be dropped");
+                } else {
+                    tx.send(Ok(())).expect("Reciever not to be dropped");
+                }
             }
             // Broadcast block header to the network
             // this should be called after block is validate and added to local chain

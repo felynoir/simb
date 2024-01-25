@@ -4,6 +4,7 @@ pub mod blocktree;
 pub mod client;
 pub mod interface;
 pub mod net;
+pub mod pool;
 pub mod rpc;
 pub mod tasks;
 

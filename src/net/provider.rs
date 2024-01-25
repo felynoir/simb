@@ -94,10 +94,14 @@ impl BroadcastProvider for NetworkProvider {
         self.send_command(NetworkProviderMessage::BroadcastBlockHeader { header, tx })
             .expect("Receiver not to be dropped.");
 
-        Box::pin(async { rx.await.expect("Sender not dropped") })
+        Box::pin(async { rx.await.expect("Sender not to be dropped") })
     }
 
-    fn broadcast_transactions(&self, _transactions: Vec<Transaction>) -> Result<(), RequestError> {
-        todo!()
+    fn broadcast_transactions(&self, transactions: Vec<Transaction>) -> Self::Output {
+        let (tx, rx) = oneshot::channel();
+        self.send_command(NetworkProviderMessage::BroadcastTransactions { tx, transactions })
+            .expect("Receiver not to be dropped.");
+
+        Box::pin(async { rx.await.expect("Sender not to be dropped") })
     }
 }

@@ -1,6 +1,6 @@
 use core::panic;
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::HashSet,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -15,6 +15,7 @@ use crate::{
     interface::{
         BroadcastProvider, Header, HeadersProvider, HeadersRequest, PeerProvider, RequestResponse,
     },
+    pool::PoolTx,
     tasks::sync_header::{SyncHeaderBuilder, SyncHeaderOutput},
 };
 
@@ -66,6 +67,7 @@ where
 {
     pub chain: B,
     pub provider: P,
+    pub pool: PoolTx<P>,
     pub event_recv: mpsc::UnboundedReceiver<ChainNetworkEvent>,
     // a list of sync request that is in progress
     pub sync_requests: FuturesUnordered<SyncRequestsFut>,
@@ -75,7 +77,7 @@ where
     // prevent redundant sync request
     pub pending_sync_request: bool,
     // prevent redundant sync of same header
-    pub broadcasted_headers: HashMap<String, ()>,
+    pub broadcasted_headers: HashSet<String>,
 }
 
 impl<B, P> ChainNetworkManager<B, P>
@@ -85,6 +87,7 @@ where
 {
     pub fn new(
         chain: B,
+        pool: PoolTx<P>,
         provider: P,
         event_recv: mpsc::UnboundedReceiver<ChainNetworkEvent>,
     ) -> Self {
@@ -92,6 +95,7 @@ where
             chain,
             provider,
             event_recv,
+            pool,
             sync_requests: Default::default(),
             broadcast_requests: Default::default(),
             closest_peers_request_for_sync: Default::default(),
@@ -154,14 +158,11 @@ where
                         // continue to broadcast new block header even we can't validate it.
                         // base on assumption that network is truthworthy so we can leave the majority validate this broadcasted header
                         // NOTE: This will never broadcast the block that we mined twice since it will not be ahead of us.
-                        match self.broadcasted_headers.entry(header.hash.clone()) {
-                            Entry::Occupied(_) => {}
-                            Entry::Vacant(entry) => {
-                                debug!("Send broadcast request for header: {:?}", header);
-                                self.broadcast_requests
-                                    .push(self.provider.broadcast_block_header(header.clone()));
-                                entry.insert(());
-                            }
+                        if !self.broadcasted_headers.contains(&header.hash) {
+                            debug!("Send broadcast request for header: {:?}", header);
+                            self.broadcast_requests
+                                .push(self.provider.broadcast_block_header(header.clone()));
+                            self.broadcasted_headers.insert(header.hash.clone());
                         }
 
                         // consider manually track peers for more optimization i.e. we can request sync for each peer individually
@@ -192,9 +193,15 @@ where
                     }
                 }
             }
-            ChainNetworkEvent::IncomingTransactions { transactions: _tx } => {
-                info!("new transaction received");
-                //self.chain.try_add_transaction(transactions);
+            ChainNetworkEvent::IncomingTransactions { transactions } => {
+                info!("Got new ({}) transactions", transactions.len());
+                let added = self.pool.add_transactions(transactions.clone());
+                info!("Added {} transactions to pool {:?}", added.len(), added);
+
+                // broadcast it all
+
+                self.broadcast_requests
+                    .push(self.provider.broadcast_transactions(transactions));
             }
             ChainNetworkEvent::GetBlockHeaders {
                 respond,
@@ -349,7 +356,7 @@ pub mod tests {
     use crate::{
         blocktree::{calculate_hash, Error},
         interface::{BroadcastFut, ClosestPeersFut, HeadersFut, HeadersRequest},
-        net::{GetHeadersRequest, NetworkProviderMessage},
+        net::{provider::NetworkProvider, GetHeadersRequest, NetworkProviderMessage},
         TRACING,
     };
 
@@ -491,6 +498,7 @@ pub mod tests {
 
     impl BroadcastProvider for MockProvider {
         type Output = BroadcastFut;
+
         fn broadcast_block_header(&self, header: Header) -> Self::Output {
             debug!("Received broadcast request for header: {:?}", header);
             let (tx, _rx) = oneshot::channel();
@@ -504,9 +512,18 @@ pub mod tests {
 
         fn broadcast_transactions(
             &self,
-            _transactions: Vec<crate::interface::Transaction>,
-        ) -> RequestResponse<()> {
-            todo!()
+            transactions: Vec<crate::interface::Transaction>,
+        ) -> Self::Output {
+            debug!(
+                "Received broadcast request for {} transactions",
+                transactions.len()
+            );
+            let (tx, _rx) = oneshot::channel();
+            self.sender
+                .send(NetworkProviderMessage::BroadcastTransactions { tx, transactions })
+                .expect("Receiver should be alive");
+
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -567,6 +584,7 @@ pub mod tests {
 
         let chain = MockChain::new(0, emitter);
         let provider = MockProvider::new(broadcast_tx, client_tx);
+        let pool = PoolTx::new(provider.clone());
 
         spawn(async move {
             loop {
@@ -585,7 +603,7 @@ pub mod tests {
             }
         });
 
-        let manager = ChainNetworkManager::new(chain.clone(), provider, chain_rx);
+        let manager = ChainNetworkManager::new(chain.clone(), pool, provider, chain_rx);
 
         // advance polling for sync header process.
         spawn(async move { manager.await });
@@ -628,7 +646,8 @@ pub mod tests {
         let chain = MockChain::new(0, emitter);
         let provider = MockProvider::new(broadcast_tx, client_tx);
 
-        let manager = ChainNetworkManager::new(chain.clone(), provider, chain_rx);
+        let pool = PoolTx::new(provider.clone());
+        let manager = ChainNetworkManager::new(chain.clone(), pool, provider, chain_rx);
 
         chain_tx
             .send(ChainNetworkEvent::IncomingNewBlockHeader {
@@ -759,7 +778,8 @@ pub mod tests {
     async fn test_handle_get_headers_request() {
         let chain = MockChain::new(100, mpsc::unbounded_channel().0);
         let provider = MockProvider::new(mpsc::unbounded_channel().0, mpsc::unbounded_channel().0);
-        let manager = ChainNetworkManager::new(chain, provider, mpsc::unbounded_channel().1);
+        let pool = PoolTx::new(provider.clone());
+        let manager = ChainNetworkManager::new(chain, pool, provider, mpsc::unbounded_channel().1);
 
         let headers = manager.handle_get_block_headers_request(HeadersRequest {
             limit: 50,
@@ -789,5 +809,62 @@ pub mod tests {
         });
         // should get empty result
         assert_eq!(headers.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_incoming_transactions() {
+        Lazy::force(&TRACING);
+
+        let (chain_tx, chain_rx) = mpsc::unbounded_channel();
+        let (broadcast_tx, mut broadcast_rx) = mpsc::unbounded_channel();
+        let (emitter, _new_block_added_rx) = mpsc::unbounded_channel();
+        let (client_tx, _) = mpsc::unbounded_channel();
+
+        let chain = MockChain::new(0, emitter);
+        let provider = MockProvider::new(broadcast_tx, client_tx);
+        let pool = PoolTx::new(provider.clone());
+
+        let manager = ChainNetworkManager::new(chain.clone(), pool.clone(), provider, chain_rx);
+
+        // advance polling for sync header process.
+        spawn(async move { manager.await });
+
+        let expected_transactions = vec![PoolTx::<NetworkProvider>::tx_rng(); 10];
+        chain_tx
+            .send(ChainNetworkEvent::IncomingTransactions {
+                transactions: expected_transactions.clone(),
+            })
+            .unwrap();
+
+        // check broadcast event is triggered
+        match broadcast_rx.recv().await {
+            Some(NetworkProviderMessage::BroadcastTransactions { transactions, .. }) => {
+                assert_eq!(transactions, expected_transactions);
+            }
+            _ => panic!("broadcast should be ignored"),
+        }
+
+        assert_eq!(pool.pool.read().unwrap().len(), 1);
+
+        let mut txs = vec![];
+        for _ in 0..10 {
+            txs.push(PoolTx::<NetworkProvider>::tx_rng());
+        }
+
+        chain_tx
+            .send(ChainNetworkEvent::IncomingTransactions {
+                transactions: txs.clone(),
+            })
+            .unwrap();
+
+        // check broadcast event is triggered
+        match broadcast_rx.recv().await {
+            Some(NetworkProviderMessage::BroadcastTransactions { transactions, .. }) => {
+                assert_eq!(transactions, txs);
+            }
+            _ => panic!("broadcast should be ignored"),
+        }
+
+        assert_eq!(pool.pool.read().unwrap().len(), 11);
     }
 }

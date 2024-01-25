@@ -9,8 +9,9 @@ use crate::{
         chain::ChainNetworkManager,
         network::{AppBehaviour, NetworkManager},
         provider::NetworkProvider,
-        BLOCK_HEADER,
+        BLOCK_HEADER, TRANSACTIONS,
     },
+    pool::PoolTx,
     rpc::RpcServerBuilder,
 };
 
@@ -63,7 +64,7 @@ impl ClientBuilder {
     }
 
     pub async fn execute_with_seed_nodes(mut self, seed_nodes: Vec<Multiaddr>) {
-        let (blockchain, mut provider, h1, h2) = self.start_network();
+        let (blockchain, _pool, mut provider, h1, h2) = self.start_network();
 
         if self.listening_addrs.is_empty() {
             provider
@@ -104,6 +105,7 @@ impl ClientBuilder {
         &mut self,
     ) -> (
         Chain<NetworkProvider>,
+        PoolTx<NetworkProvider>,
         NetworkProvider,
         tokio::task::JoinHandle<()>,
         tokio::task::JoinHandle<()>,
@@ -126,6 +128,11 @@ impl ClientBuilder {
             .gossipsub
             .subscribe(&BLOCK_HEADER)
             .unwrap();
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&TRANSACTIONS)
+            .unwrap();
 
         let (command_send, command_recv) = mpsc::unbounded_channel();
         let provider = NetworkProvider::new(command_send);
@@ -136,13 +143,18 @@ impl ClientBuilder {
         );
 
         let (network, chain_manager_rx) = NetworkManager::new(swarm, command_recv);
-        let chain_manager =
-            ChainNetworkManager::new(blockchain.clone(), provider.clone(), chain_manager_rx);
+        let pool = PoolTx::new(provider.clone());
+        let chain_manager = ChainNetworkManager::new(
+            blockchain.clone(),
+            pool.clone(),
+            provider.clone(),
+            chain_manager_rx,
+        );
 
         let handle1 = spawn(network.run());
         let handle2 = spawn(chain_manager);
 
-        (blockchain, provider, handle1, handle2)
+        (blockchain, pool, provider, handle1, handle2)
     }
 }
 
@@ -160,7 +172,9 @@ mod tests {
 
     use crate::{
         blocktree::{BlockTree, Chain},
+        interface::Transaction,
         net::provider::NetworkProvider,
+        pool::PoolTx,
         TRACING,
     };
 
@@ -171,6 +185,7 @@ mod tests {
         id: PeerId,
         provider: NetworkProvider,
         blockchain: Chain<NetworkProvider>,
+        pool: PoolTx<NetworkProvider>,
         addrs: Vec<Multiaddr>,
     }
 
@@ -179,7 +194,7 @@ mod tests {
             let keypair = Keypair::generate_ed25519();
             let dir = TempDir::new("db").unwrap();
             let db_path = dir.path().join(format!("db_{}.redb", idx));
-            let (blockchain, mut provider, _, _) = ClientBuilder::default()
+            let (blockchain, pool, mut provider, _, _) = ClientBuilder::default()
                 .with_db_path(db_path)
                 .with_mdns(false)
                 .with_keypair(keypair.clone())
@@ -195,6 +210,7 @@ mod tests {
 
             Self {
                 id,
+                pool,
                 addrs,
                 provider,
                 blockchain,
@@ -209,6 +225,16 @@ mod tests {
             match self.blockchain.mine_and_broadcast_block().await {
                 Err(e) => error!("Failed to mine block: {:?}", e),
                 Ok(res) => info!("Mining result: {:?}", res),
+            }
+        }
+
+        pub async fn add_external_transaction(&mut self, tx: Transaction) {
+            match self.pool.add_transactions_and_broadcast(vec![tx]).await {
+                Err(e) => error!("Failed to broadcast transactions: {:?}", e),
+                Ok(hashes) => info!(
+                    "Add and broadcast transaction: {:?}",
+                    hashes.first().unwrap()
+                ),
             }
         }
     }
@@ -369,6 +395,28 @@ mod tests {
                     .collect::<Vec<_>>()
             },
             100,
+            Duration::from_millis(100),
+            expected,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_two_node_sync_transaction() {
+        let mut nodes = spawn_nodes(2).await;
+
+        nodes[0].dial(nodes[1].id, nodes[1].addrs[0].clone()).await;
+        // wait for gossipsub to do the task.
+        sleep(Duration::from_secs(2)).await;
+
+        let tx = PoolTx::<NetworkProvider>::tx_rng();
+        nodes[0].add_external_transaction(tx).await;
+
+        let expected = nodes[0].pool.get_all();
+
+        assert_eq_with_retry(
+            || async { nodes[1].pool.get_all() },
+            10,
             Duration::from_millis(100),
             expected,
         )

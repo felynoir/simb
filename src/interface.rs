@@ -25,9 +25,12 @@ pub struct Header {
     pub hash: String,
 }
 
-#[derive(Serialize, Deserialize, RlpDecodable, RlpEncodable, Debug, Clone)]
+#[derive(
+    Serialize, Deserialize, PartialEq, Eq, RlpDecodable, RlpEncodable, Debug, Clone, Default,
+)]
 pub struct Transaction {
-    pub block_number: u64,
+    // pub block_number: u64,
+    pub hash: String,
     pub from: String,
     pub to: String,
     pub value: u64,
@@ -47,6 +50,11 @@ pub struct HeadersRequest {
     pub limit: u64,
     /// a block which we want to start syncing from
     pub start_block: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TransactionsRequest {
+    pub hashes: Vec<String>,
 }
 
 pub type RequestResponse<T> = Result<T, RequestError>;
@@ -91,7 +99,7 @@ pub trait BroadcastProvider {
     type Output: Future<Output = RequestResponse<()>> + Sync + Send + Unpin;
     fn broadcast_block_header(&self, header: Header) -> Self::Output;
 
-    fn broadcast_transactions(&self, transactions: Vec<Transaction>) -> RequestResponse<()>;
+    fn broadcast_transactions(&self, transactions: Vec<Transaction>) -> Self::Output;
 }
 
 /// Error variants that can happen when sending requests to network manager.

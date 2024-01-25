@@ -44,6 +44,7 @@ pub enum NetworkProviderMessage {
         tx: oneshot::Sender<RequestResponse<()>>,
     },
     BroadcastTransactions {
+        tx: oneshot::Sender<RequestResponse<()>>,
         transactions: Vec<Transaction>,
     },
     GetHeaders(GetHeadersRequest),
