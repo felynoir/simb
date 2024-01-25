@@ -2,6 +2,8 @@
 
 This project, a simplified blockchain node client, is purely experimental and not intended for production use or as a reference. It offers a user experience similar to an Ethereum client, but with most functionalities being mocked, including:
 
+> Note: This implementation only support for one miner.
+
 Most of functionality is in the mock for example:
 
 - Block Mining and Generation: Simplified mock-up of the actual mining process.
@@ -36,3 +38,28 @@ All transactions in the local pool are pending and assumed valid. The system bro
 ### Requesting Block Headers
 
 Block header requests are handled using libp2p's request/response mechanism. Requests are broken down into batches for each peer. If a batch is invalid or incomplete, the system syncs up to the last valid header, ignoring the rest. This eliminates the need for retry mechanisms, streamlining the system and relying on subsequent headers to restart the sync process. Future improvements may involve enhancing peer reputation mechanisms to avoid reliance on unreliable peers.
+
+## Usage
+
+Options:
+
+- seed: rng for peer's keypair
+- peers: Bootstrapping peer to build up DHT
+- db-path: Local database path (default: ./db.redb or with seed ./db-{seed}.redb)
+- auto-mine-interval time for interval in second (Current implementation can only have one miner)
+
+Running 2 node would be like
+
+```
+cargo run -- --seed 1
+```
+
+and (even we give bootstrapping peer it won't different much since we have mdns enabled)
+
+```
+cargo run --  --seed 2 --peers /ip4/127.0.0.1/tcp/53014/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
+```
+
+Rpc query example reside in `examples/rpc_client.rs`
+
+for more usage for node can be seen in `src/client.rs::test_two_node_sync`.
