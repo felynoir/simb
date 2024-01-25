@@ -91,7 +91,7 @@ where
 
         let server = Server::builder()
             .set_http_middleware(service_builder)
-            .build("0.0.0.0:0")
+            .build("127.0.0.1:0")
             .await
             .unwrap();
 
