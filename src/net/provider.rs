@@ -81,7 +81,7 @@ impl HeadersProvider for NetworkProvider {
 impl BodyProvider for NetworkProvider {
     type Output = BodiesFut;
     fn get_bodies(&self, _request: BodyRequest) -> Self::Output {
-        todo!()
+        unimplemented!()
     }
 }
 

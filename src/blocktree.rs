@@ -144,6 +144,8 @@ pub trait BlockTree: Send + Sync + Clone + Unpin + 'static {
 
 /// (block_number, block_header)
 const HEADER: TableDefinition<u64, Vec<u8>> = TableDefinition::new("header");
+/// (block_hash, block_number)
+const HASH: TableDefinition<&str, u64> = TableDefinition::new("hash");
 
 #[derive(Clone)]
 pub struct Chain<P>
@@ -166,23 +168,36 @@ where
         let genesis = Self::genesis();
         let write_txn = db.begin_write().expect("writable");
         {
+            info!("Haha");
+
             let mut table = write_txn.open_table(HEADER).expect("open table");
             let mut buf = Vec::new();
             genesis.encode(&mut buf);
             table.insert(genesis.number, buf).expect("insert genesis");
+            info!("Haha");
+
+            let mut table = write_txn.open_table(HASH).expect("open table");
+            table
+                .insert(genesis.hash.as_str(), genesis.number)
+                .expect("insert genesis");
         }
         write_txn.commit().expect("commit genesis");
+        info!("Haha");
 
         let chain = Self {
             db: Arc::new(RwLock::new(db)),
             provider,
         };
 
+        info!("Haha");
+
         if let Some(itv) = auto_mine {
             info!("Start auto mining with interval {}s", itv);
             let miner = FixedBlockTimeMiner::new(chain.clone(), itv, chain.provider.clone());
             spawn(miner.execute());
         }
+
+        info!("Haha");
 
         chain
     }
@@ -228,15 +243,20 @@ where
 
         let old_tip = self.tip()?;
 
-        let binding = self.db.read().expect("db available");
-        let write_txn = binding.begin_write()?;
         {
-            let mut table = write_txn.open_table(HEADER)?;
-            let mut buf = Vec::new();
-            header.encode(&mut buf);
-            table.insert(header.number, buf)?;
+            let binding = self.db.write().expect("db available");
+            let write_txn = binding.begin_write()?;
+            {
+                let mut table = write_txn.open_table(HEADER)?;
+                let mut buf = Vec::new();
+                header.encode(&mut buf);
+                table.insert(header.number.clone(), buf)?;
+
+                let mut table = write_txn.open_table(HASH)?;
+                table.insert(header.hash.as_str(), header.number)?;
+            }
+            write_txn.commit()?;
         }
-        write_txn.commit()?;
 
         if old_tip.number < self.tip()?.number {
             Ok(AddedBlockResult::ExtendTip)
@@ -257,8 +277,14 @@ where
         Err(Error::BlockHeaderNotFound)
     }
 
-    fn get_header_by_hash(&self, _hash: String) -> Result<Header, Error> {
-        todo!()
+    fn get_header_by_hash(&self, hash: String) -> Result<Header, Error> {
+        let binding = self.db.read().expect("db available");
+        let read_txn = binding.begin_read()?;
+        let table = read_txn.open_table(HASH)?;
+        if let Some(block_number) = table.get(hash.as_str())? {
+            return self.get_header_by_block_number(block_number.value());
+        }
+        Err(Error::BlockHeaderNotFound)
     }
 
     // NOTE: this is not support chain re-org

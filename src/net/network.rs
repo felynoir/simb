@@ -99,7 +99,7 @@ impl Future for GetBlockHeaders {
 /// Manage entire network and peer related event
 /// being a entry point for network related event and advancing network state:
 ///  - Incoming header
-///  - Incoming transaction (todo)
+///  - Incoming transaction
 ///
 /// This should be treat as [Future] and spawn in separate task and run endlessly
 ///
