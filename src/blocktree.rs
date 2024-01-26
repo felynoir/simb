@@ -168,13 +168,10 @@ where
         let genesis = Self::genesis();
         let write_txn = db.begin_write().expect("writable");
         {
-            info!("Haha");
-
             let mut table = write_txn.open_table(HEADER).expect("open table");
             let mut buf = Vec::new();
             genesis.encode(&mut buf);
             table.insert(genesis.number, buf).expect("insert genesis");
-            info!("Haha");
 
             let mut table = write_txn.open_table(HASH).expect("open table");
             table
@@ -182,22 +179,17 @@ where
                 .expect("insert genesis");
         }
         write_txn.commit().expect("commit genesis");
-        info!("Haha");
 
         let chain = Self {
             db: Arc::new(RwLock::new(db)),
             provider,
         };
 
-        info!("Haha");
-
         if let Some(itv) = auto_mine {
             info!("Start auto mining with interval {}s", itv);
             let miner = FixedBlockTimeMiner::new(chain.clone(), itv, chain.provider.clone());
             spawn(miner.execute());
         }
-
-        info!("Haha");
 
         chain
     }
